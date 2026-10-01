@@ -2,6 +2,8 @@
 using BepInEx.Bootstrap;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using Common;
+using HarmonyLib;
 using Mono.Cecil;
 using System;
 using System.Collections;
@@ -10,8 +12,6 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
-using Common;
-using HarmonyLib;
 using UnityEngine;
 
 namespace ScriptEngine
@@ -99,8 +99,7 @@ namespace ScriptEngine
             var files = Directory.GetFiles(ScriptDirectory, "*.dll", IncludeSubdirectories.Value ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly);
             if (files.Length > 0)
             {
-                foreach (string path in Directory.GetFiles(ScriptDirectory, "*.dll", IncludeSubdirectories.Value ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
-                    LoadDLL(path, scriptManager);
+                LoadDLLs(files, scriptManager);
 
                 if (!QuietMode.Value)
                     Logger.LogMessage("Reloaded all plugins!");
@@ -112,98 +111,137 @@ namespace ScriptEngine
             }
         }
 
-        private void LoadDLL(string path, GameObject obj)
+        private Assembly LoadAssembly(AssemblyDefinition definition)
         {
-            var defaultResolver = new DefaultAssemblyResolver();
-            defaultResolver.AddSearchDirectory(ScriptDirectory);
-            defaultResolver.AddSearchDirectory(Paths.ManagedPath);
-            defaultResolver.AddSearchDirectory(Paths.BepInExAssemblyDirectory);
-
-            if (!QuietMode.Value)
-                Logger.Log(LogLevel.Info, $"Loading plugins from {path}");
-
-            using (var dll = AssemblyDefinition.ReadAssembly(path, new ReaderParameters {
-                AssemblyResolver = defaultResolver,
-                ReadSymbols = true
-            }))
+            if (DumpAssemblies.Value)
             {
-                dll.Name.Name = $"{dll.Name.Name}-{DateTime.Now.Ticks}";
-                Assembly ass;
+                // Dump assemblies & load them from disk
+                if (!Directory.Exists(DumpedAssembliesPath))
+                    Directory.CreateDirectory(DumpedAssembliesPath);
 
-                if (DumpAssemblies.Value)
-                {
-                    // Dump assembly & load it from disk
-                    if (!Directory.Exists(DumpedAssembliesPath))
-                        Directory.CreateDirectory(DumpedAssembliesPath);
-   
-                    string assemblyDumpPath = Path.Combine(DumpedAssembliesPath, dll.Name.Name + Path.GetExtension(dll.MainModule.Name));
+                    string assemblyDumpPath = Path.Combine(DumpedAssembliesPath, definition.Name.Name + Path.GetExtension(definition.MainModule.Name));
 
                     using (FileStream outFileStream = new FileStream(assemblyDumpPath, FileMode.Create))
                     {
-                        dll.Write((Stream)outFileStream, new WriterParameters()
+                        definition.Write(outFileStream, new WriterParameters()
                         {
                             WriteSymbols = true
                         });
                     }
 
-                    ass = Assembly.LoadFile(assemblyDumpPath);
-                    if (!QuietMode.Value)
-                        Logger.Log(LogLevel.Info, $"Loaded dumped Assembly from {assemblyDumpPath}");
-                } else
+                    var assembly = Assembly.LoadFile(assemblyDumpPath);
+                if (!QuietMode.Value)
+                    Logger.Log(LogLevel.Info, $"Loaded dumped Assembly from {assemblyDumpPath}");
+                return assembly;
+            }
+
+            // Otherwise, load in memory.
+            using (var stream = new MemoryStream())
+            {
+                definition.Write(stream);
+                return Assembly.Load(stream.ToArray());
+            }
+        }
+
+        private void LoadDLLs(IEnumerable<string> paths, GameObject obj)
+        {
+            var suffix = $"-{DateTime.Now.Ticks}";
+            using (var resolver = new ScriptEngineResolver(LoadAssembly))
+            {
+                resolver.AddSearchDirectory(ScriptDirectory);
+                resolver.AddSearchDirectory(Paths.ManagedPath);
+                resolver.AddSearchDirectory(Paths.BepInExAssemblyDirectory);
+
+                // Load definitions.
+                foreach (var path in paths)
                 {
-                    // Load from memory
-                    using (var ms = new MemoryStream())
+                    var definition = AssemblyDefinition.ReadAssembly(path, new ReaderParameters
                     {
-                        dll.Write(ms);
-                        ass = Assembly.Load(ms.ToArray());
+                        AssemblyResolver = resolver,
+                        ReadingMode = ReadingMode.Immediate,
+                        ReadSymbols = true
+                    });
+
+                    var oldName = definition.Name.Name;
+                    var newName = $"{oldName}{suffix}";
+                    definition.Name.Name = newName;
+                    resolver.AddDefinition(oldName, definition, path);
+                }
+
+                // Update references.
+                foreach (var definition in resolver.GetDefinitions())
+                {
+                    foreach (var module in definition.Modules)
+                    {
+                        foreach (var reference in module.AssemblyReferences)
+                        {
+                            if (resolver.RenameReference(reference.Name, out var renamed))
+                                reference.Name = renamed;
+                        }
                     }
                 }
 
-
-                foreach (Type type in GetTypesSafe(ass))
+                var assemblies = new List<ScriptEngineResolver.ResolvedAssembly>();
+                AppDomain.CurrentDomain.AssemblyResolve += resolver.LoadHandler;
+                try
                 {
-                    try
+                    // Load assemblies.
+                    foreach (var definition in resolver.GetDefinitions())
+                        assemblies.Add(resolver.LoadAssembly(definition));
+                }
+                finally
+                {
+                    AppDomain.CurrentDomain.AssemblyResolve -= resolver.LoadHandler;
+                }
+
+                // Reload plugins.
+                foreach (var (definition, assembly) in assemblies)
+                {
+                    foreach (var type in GetTypesSafe(assembly))
                     {
-                        if (!typeof(BaseUnityPlugin).IsAssignableFrom(type)) continue;
-
-                        var metadata = MetadataHelper.GetMetadata(type);
-                        if (metadata == null) continue;
-
-                        if (!QuietMode.Value)
-                            Logger.Log(LogLevel.Info, $"Loading {metadata.GUID}");
-
-                        if (Chainloader.PluginInfos.TryGetValue(metadata.GUID, out var existingPluginInfo))
-                            throw new InvalidOperationException($"A plugin with GUID {metadata.GUID} is already loaded! ({existingPluginInfo.Metadata.Name} v{existingPluginInfo.Metadata.Version})");
-
-                        var typeDefinition = dll.MainModule.Types.First(x => x.FullName == type.FullName);
-                        var pluginInfo = Chainloader.ToPluginInfo(typeDefinition);
-
-                        StartCoroutine(DelayAction(() =>
+                        try
                         {
-                            try
-                            {
-                                // Need to add to PluginInfos first because BaseUnityPlugin constructor (called by AddComponent below)
-                                // looks in PluginInfos for an existing PluginInfo and uses it instead of creating a new one.
-                                Chainloader.PluginInfos[metadata.GUID] = pluginInfo;
+                            if (!typeof(BaseUnityPlugin).IsAssignableFrom(type)) continue;
 
-                                var instance = obj.AddComponent(type);
+                            var metadata = MetadataHelper.GetMetadata(type);
+                            if (metadata == null) continue;
 
-                                // Fill in properties that are normally set by Chainloader
-                                var tv = Traverse.Create(pluginInfo);
-                                tv.Property<BaseUnityPlugin>(nameof(pluginInfo.Instance)).Value = (BaseUnityPlugin)instance;
-                                // Loading the assembly from memory causes Location to be lost
-                                tv.Property<string>(nameof(pluginInfo.Location)).Value = path;
-                            }
-                            catch (Exception e)
+                            if (!QuietMode.Value)
+                                Logger.Log(LogLevel.Info, $"Loading {metadata.GUID}");
+
+                            if (Chainloader.PluginInfos.TryGetValue(metadata.GUID, out var existingPluginInfo))
+                                throw new InvalidOperationException($"A plugin with GUID {metadata.GUID} is already loaded! ({existingPluginInfo.Metadata.Name} v{existingPluginInfo.Metadata.Version})");
+
+                            var typeDefinition = definition.MainModule.Types.First(x => x.FullName == type.FullName);
+                            var pluginInfo = Chainloader.ToPluginInfo(typeDefinition);
+
+                            StartCoroutine(DelayAction(() =>
                             {
-                                Logger.LogError($"Failed to load plugin {metadata.GUID} because of exception: {e}");
-                                Chainloader.PluginInfos.Remove(metadata.GUID);
-                            }
-                        }));
-                    }
-                    catch (Exception e)
-                    {
-                        Logger.LogError($"Failed to load plugin {type.Name} because of exception: {e}");
+                                try
+                                {
+                                    // Need to add to PluginInfos first because BaseUnityPlugin constructor (called by AddComponent below)
+                                    // looks in PluginInfos for an existing PluginInfo and uses it instead of creating a new one.
+                                    Chainloader.PluginInfos[metadata.GUID] = pluginInfo;
+
+                                    var instance = obj.AddComponent(type);
+
+                                    // Fill in properties that are normally set by Chainloader
+                                    var tv = Traverse.Create(pluginInfo);
+                                    tv.Property<BaseUnityPlugin>(nameof(pluginInfo.Instance)).Value = (BaseUnityPlugin)instance;
+                                    // Loading the assembly from memory causes Location to be lost
+                                    tv.Property<string>(nameof(pluginInfo.Location)).Value = resolver.GetPath(definition);
+                                }
+                                catch (Exception e)
+                                {
+                                    Logger.LogError($"Failed to load plugin {metadata.GUID} because of exception: {e}");
+                                    Chainloader.PluginInfos.Remove(metadata.GUID);
+                                }
+                            }));
+                        }
+                        catch (Exception e)
+                        {
+                            Logger.LogError($"Failed to load plugin {type.Name} because of exception: {e}");
+                        }
                     }
                 }
             }
@@ -213,10 +251,10 @@ namespace ScriptEngine
         {
             fileSystemWatcher = new FileSystemWatcher(ScriptDirectory)
             {
-                IncludeSubdirectories = IncludeSubdirectories.Value
+                IncludeSubdirectories = IncludeSubdirectories.Value,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName,
+                Filter = "*.dll"
             };
-            fileSystemWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName;
-            fileSystemWatcher.Filter = "*.dll";
             fileSystemWatcher.Changed += FileChangedEventHandler;
             fileSystemWatcher.Deleted += FileChangedEventHandler;
             fileSystemWatcher.Created += FileChangedEventHandler;
