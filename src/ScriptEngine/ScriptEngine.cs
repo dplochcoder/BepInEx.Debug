@@ -119,19 +119,20 @@ namespace ScriptEngine
                 if (!Directory.Exists(DumpedAssembliesPath))
                     Directory.CreateDirectory(DumpedAssembliesPath);
 
-                    string assemblyDumpPath = Path.Combine(DumpedAssembliesPath, definition.Name.Name + Path.GetExtension(definition.MainModule.Name));
+                string assemblyDumpPath = Path.Combine(DumpedAssembliesPath, definition.Name.Name + Path.GetExtension(definition.MainModule.Name));
 
-                    using (FileStream outFileStream = new FileStream(assemblyDumpPath, FileMode.Create))
+                using (FileStream outFileStream = new FileStream(assemblyDumpPath, FileMode.Create))
+                {
+                    definition.Write(outFileStream, new WriterParameters()
                     {
-                        definition.Write(outFileStream, new WriterParameters()
-                        {
-                            WriteSymbols = true
-                        });
-                    }
+                        WriteSymbols = true
+                    });
+                }
 
-                    var assembly = Assembly.LoadFile(assemblyDumpPath);
+                var assembly = Assembly.LoadFile(assemblyDumpPath);
                 if (!QuietMode.Value)
                     Logger.Log(LogLevel.Info, $"Loaded dumped Assembly from {assemblyDumpPath}");
+
                 return assembly;
             }
 
