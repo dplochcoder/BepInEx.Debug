@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Security.Policy;
 using System.Text;
 using UnityEngine;
 
@@ -39,6 +40,7 @@ namespace ScriptEngine
         private FileSystemWatcher fileSystemWatcher;
         private bool shouldReload;
         private float autoReloadTimer;
+        private ScriptEngineResolver currentResolver;
 
         private void Awake()
         {
@@ -182,18 +184,17 @@ namespace ScriptEngine
                     }
                 }
 
-                var assemblies = new List<ScriptEngineResolver.ResolvedAssembly>();
+                // Replace the old resolver.
+                if (currentResolver != null)
+                {
+                    AppDomain.CurrentDomain.AssemblyResolve -= currentResolver.LoadHandler;
+                    currentResolver.Dispose();
+                }
+                currentResolver = resolver;
                 AppDomain.CurrentDomain.AssemblyResolve += resolver.LoadHandler;
-                try
-                {
-                    // Load assemblies.
-                    foreach (var definition in resolver.GetDefinitions())
-                        assemblies.Add(resolver.LoadAssembly(definition));
-                }
-                finally
-                {
-                    AppDomain.CurrentDomain.AssemblyResolve -= resolver.LoadHandler;
-                }
+
+                // Load assemblies.
+                var assemblies = resolver.GetDefinitions().Select(resolver.LoadAssembly).ToList();
 
                 // Reload plugins.
                 foreach (var (definition, assembly) in assemblies)

@@ -82,9 +82,14 @@ namespace ScriptEngine
 
         protected override void Dispose(bool disposing)
         {
-            foreach (var definition in overrides.Values)
+            base.Dispose(disposing);
+
+            foreach (var definition in definitions)
                 definition.Dispose();
+            definitions.Clear();
             overrides.Clear();
+            paths.Clear();
+            cache.Clear();
         }
     }
 }
