@@ -149,101 +149,100 @@ namespace ScriptEngine
         private void LoadDLLs(IEnumerable<string> paths, GameObject obj)
         {
             var suffix = $"-{DateTime.Now.Ticks}";
-            using (var resolver = new ScriptEngineResolver(LoadAssembly))
+
+            var resolver = new ScriptEngineResolver(LoadAssembly);
+            resolver.AddSearchDirectory(ScriptDirectory);
+            resolver.AddSearchDirectory(Paths.ManagedPath);
+            resolver.AddSearchDirectory(Paths.BepInExAssemblyDirectory);
+
+            // Load definitions.
+            foreach (var path in paths)
             {
-                resolver.AddSearchDirectory(ScriptDirectory);
-                resolver.AddSearchDirectory(Paths.ManagedPath);
-                resolver.AddSearchDirectory(Paths.BepInExAssemblyDirectory);
-
-                // Load definitions.
-                foreach (var path in paths)
+                var definition = AssemblyDefinition.ReadAssembly(path, new ReaderParameters
                 {
-                    var definition = AssemblyDefinition.ReadAssembly(path, new ReaderParameters
-                    {
-                        AssemblyResolver = resolver,
-                        ReadingMode = ReadingMode.Immediate,
-                        ReadSymbols = true
-                    });
+                    AssemblyResolver = resolver,
+                    ReadingMode = ReadingMode.Immediate,
+                    ReadSymbols = true
+                });
 
-                    var oldName = definition.Name.Name;
-                    var newName = $"{oldName}{suffix}";
-                    definition.Name.Name = newName;
-                    resolver.AddDefinition(oldName, definition, path);
-                }
+                var oldName = definition.Name.Name;
+                var newName = $"{oldName}{suffix}";
+                definition.Name.Name = newName;
+                resolver.AddDefinition(oldName, definition, path);
+            }
 
-                // Update references.
-                foreach (var definition in resolver.GetDefinitions())
+            // Update references.
+            foreach (var definition in resolver.GetDefinitions())
+            {
+                foreach (var module in definition.Modules)
                 {
-                    foreach (var module in definition.Modules)
+                    foreach (var reference in module.AssemblyReferences)
                     {
-                        foreach (var reference in module.AssemblyReferences)
-                        {
-                            if (resolver.RenameReference(reference.Name, out var renamed))
-                                reference.Name = renamed;
-                        }
+                        if (resolver.RenameReference(reference.Name, out var renamed))
+                            reference.Name = renamed;
                     }
                 }
+            }
 
-                // Replace the old resolver.
-                if (currentResolver != null)
+            // Replace the old resolver.
+            if (currentResolver != null)
+            {
+                AppDomain.CurrentDomain.AssemblyResolve -= currentResolver.LoadHandler;
+                currentResolver.Dispose();
+            }
+            currentResolver = resolver;
+            AppDomain.CurrentDomain.AssemblyResolve += resolver.LoadHandler;
+
+            // Load assemblies.
+            var assemblies = resolver.GetDefinitions().Select(resolver.LoadAssembly).ToList();
+
+            // Reload plugins.
+            foreach (var (definition, assembly) in assemblies)
+            {
+                foreach (var type in GetTypesSafe(assembly))
                 {
-                    AppDomain.CurrentDomain.AssemblyResolve -= currentResolver.LoadHandler;
-                    currentResolver.Dispose();
-                }
-                currentResolver = resolver;
-                AppDomain.CurrentDomain.AssemblyResolve += resolver.LoadHandler;
-
-                // Load assemblies.
-                var assemblies = resolver.GetDefinitions().Select(resolver.LoadAssembly).ToList();
-
-                // Reload plugins.
-                foreach (var (definition, assembly) in assemblies)
-                {
-                    foreach (var type in GetTypesSafe(assembly))
+                    try
                     {
-                        try
+                        if (!typeof(BaseUnityPlugin).IsAssignableFrom(type)) continue;
+
+                        var metadata = MetadataHelper.GetMetadata(type);
+                        if (metadata == null) continue;
+
+                        if (!QuietMode.Value)
+                            Logger.Log(LogLevel.Info, $"Loading {metadata.GUID}");
+
+                        if (Chainloader.PluginInfos.TryGetValue(metadata.GUID, out var existingPluginInfo))
+                            throw new InvalidOperationException($"A plugin with GUID {metadata.GUID} is already loaded! ({existingPluginInfo.Metadata.Name} v{existingPluginInfo.Metadata.Version})");
+
+                        var typeDefinition = definition.MainModule.Types.First(x => x.FullName == type.FullName);
+                        var pluginInfo = Chainloader.ToPluginInfo(typeDefinition);
+
+                        StartCoroutine(DelayAction(() =>
                         {
-                            if (!typeof(BaseUnityPlugin).IsAssignableFrom(type)) continue;
-
-                            var metadata = MetadataHelper.GetMetadata(type);
-                            if (metadata == null) continue;
-
-                            if (!QuietMode.Value)
-                                Logger.Log(LogLevel.Info, $"Loading {metadata.GUID}");
-
-                            if (Chainloader.PluginInfos.TryGetValue(metadata.GUID, out var existingPluginInfo))
-                                throw new InvalidOperationException($"A plugin with GUID {metadata.GUID} is already loaded! ({existingPluginInfo.Metadata.Name} v{existingPluginInfo.Metadata.Version})");
-
-                            var typeDefinition = definition.MainModule.Types.First(x => x.FullName == type.FullName);
-                            var pluginInfo = Chainloader.ToPluginInfo(typeDefinition);
-
-                            StartCoroutine(DelayAction(() =>
+                            try
                             {
-                                try
-                                {
-                                    // Need to add to PluginInfos first because BaseUnityPlugin constructor (called by AddComponent below)
-                                    // looks in PluginInfos for an existing PluginInfo and uses it instead of creating a new one.
-                                    Chainloader.PluginInfos[metadata.GUID] = pluginInfo;
+                                // Need to add to PluginInfos first because BaseUnityPlugin constructor (called by AddComponent below)
+                                // looks in PluginInfos for an existing PluginInfo and uses it instead of creating a new one.
+                                Chainloader.PluginInfos[metadata.GUID] = pluginInfo;
 
-                                    var instance = obj.AddComponent(type);
+                                var instance = obj.AddComponent(type);
 
-                                    // Fill in properties that are normally set by Chainloader
-                                    var tv = Traverse.Create(pluginInfo);
-                                    tv.Property<BaseUnityPlugin>(nameof(pluginInfo.Instance)).Value = (BaseUnityPlugin)instance;
-                                    // Loading the assembly from memory causes Location to be lost
-                                    tv.Property<string>(nameof(pluginInfo.Location)).Value = resolver.GetPath(definition);
-                                }
-                                catch (Exception e)
-                                {
-                                    Logger.LogError($"Failed to load plugin {metadata.GUID} because of exception: {e}");
-                                    Chainloader.PluginInfos.Remove(metadata.GUID);
-                                }
-                            }));
-                        }
-                        catch (Exception e)
-                        {
-                            Logger.LogError($"Failed to load plugin {type.Name} because of exception: {e}");
-                        }
+                                // Fill in properties that are normally set by Chainloader
+                                var tv = Traverse.Create(pluginInfo);
+                                tv.Property<BaseUnityPlugin>(nameof(pluginInfo.Instance)).Value = (BaseUnityPlugin)instance;
+                                // Loading the assembly from memory causes Location to be lost
+                                tv.Property<string>(nameof(pluginInfo.Location)).Value = resolver.GetPath(definition);
+                            }
+                            catch (Exception e)
+                            {
+                                Logger.LogError($"Failed to load plugin {metadata.GUID} because of exception: {e}");
+                                Chainloader.PluginInfos.Remove(metadata.GUID);
+                            }
+                        }));
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogError($"Failed to load plugin {type.Name} because of exception: {e}");
                     }
                 }
             }
