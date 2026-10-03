@@ -246,6 +246,9 @@ namespace ScriptEngine
                     }
                 }
             }
+
+            // We don't need the definitions anymore.
+            resolver.DisposeDefinitions();
         }
 
         private void StartFileSystemWatcher()

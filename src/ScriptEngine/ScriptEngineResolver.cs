@@ -80,12 +80,19 @@ namespace ScriptEngine
             return resolvedAssembly;
         }
 
+        // Definitions must be disposed to release file handles on the scripts/ assemblies they were read from.
+        // This should only be called once the definitions are no longer needed.
+        internal void DisposeDefinitions()
+        {
+            foreach (var definition in definitions)
+                definition.Dispose();
+        }
+
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
 
-            foreach (var definition in definitions)
-                definition.Dispose();
+            DisposeDefinitions();
             definitions.Clear();
             overrides.Clear();
             paths.Clear();
